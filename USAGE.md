@@ -10,6 +10,7 @@
 
 - 同步后台模式：Codex 调用 `qodercli -p`，等待 Qoder 完成，拿到输出后再展示给你。
 - 真异步模式：Codex 提交后立刻返回 `run_id`，Qoder 在后台跑，之后再查询状态。
+- 分层产物：长任务会分别保存完整原始输出、精简总结和结构化发现，避免 Codex 默认读取大日志。
 - YOLO 模式：后台模式的完全放权版本，Qoder 执行工具时不再要求权限确认。
 - 终端输入模式：Codex 把 prompt 直接打进你当前打开的 Terminal，让你在终端里看 Qoder 输出。
 - 桌面投递模式：使用 `qoder chat --reuse-window` 投递到 Qoder 桌面窗口，仅作为特殊 fallback。
@@ -78,8 +79,30 @@ python3 "$QODER_BRIDGE" --qodercli /absolute/path/to/qodercli status
 - `--wait`：当前命令会等 Qoder 完成。
 - `--detach`：当前命令只提交任务，立刻返回 `run_id`。
 - `--yolo`：只控制是否绕过 Qoder 权限确认，不控制同步/异步。
+- `--artifact-protocol`：要求 Qoder 写分层产物；`--detach`、`--yolo`、`app-chat` 会自动启用。
 - 不加 `--wait` 也不加 `--detach`：命令仍会等 `qodercli -p` 进程结束，只是不额外轮询；这不是真异步。
 - `--detach` 返回后，Codex 默认应该停止当前回合，只给你 `run_id` 和查询命令；只有你明确说“帮我盯着/等结果/继续查”，它才继续轮询。
+
+## 结果文件
+
+每次运行都会有一个目录：
+
+```text
+~/.codex/qoder-bridge/runs/<run-id>/
+```
+
+常用文件：
+
+- `summary.md`：给 Codex 默认读取的精简结论。
+- `findings.json`：结构化问题、测试结果、命令退出码等。
+- `raw_output.txt`：完整原始输出、长日志、详细审查记录。
+- `response.md`：兼容旧版本的最终回答，通常等同于 `summary.md`。
+- `status.json`：完成状态。
+- `stdout.txt` / `stderr.txt`：bridge 捕获到的进程输出。
+- `user-prompt.md`：你最初发给 Qoder 的 prompt。
+- `prompt.md`：实际发给 Qoder 的 prompt，长任务里会包含 mailbox 协议。
+
+Codex 默认应该只读 `summary.md` 和 `findings.json`。只有需要复核、定位失败、或总结不够时，才读 `raw_output.txt`。
 
 ## 同步后台模式
 
@@ -97,7 +120,7 @@ python3 "$QODER_BRIDGE" send \
 - 使用已登录的 `qodercli -p`
 - 当前命令会等待 Qoder 完成
 - Qoder 输出会被 Codex 捕获并展示
-- 结果会写到 `~/.codex/qoder-bridge/runs/<run-id>/response.md`
+- 结果会写到 `~/.codex/qoder-bridge/runs/<run-id>/summary.md`，并保留 `response.md` 兼容旧流程
 - 适合问答、短代码审查、快速分析任务
 - 如果 Qoder 需要权限确认，非交互环境下可能失败或返回 blocked
 
@@ -131,13 +154,14 @@ python3 "$QODER_BRIDGE" send \
 ```bash
 python3 "$QODER_BRIDGE" check <run-id>
 python3 "$QODER_BRIDGE" show <run-id>
+python3 "$QODER_BRIDGE" show --raw <run-id>
 python3 "$QODER_BRIDGE" wait <run-id> --timeout 60
 ```
 
 状态含义：
 
 - `pending`：后台 worker 还在跑，或还没写出完成文件。
-- `done`：Qoder 已完成，`response.md` 可读。
+- `done`：Qoder 已完成，`summary.md` 或 `response.md` 可读。
 - `error`：Qoder 或 bridge worker 失败。
 - `blocked`：任务无法可靠完成，比如桌面投递没有写回 mailbox。
 
@@ -147,6 +171,13 @@ python3 "$QODER_BRIDGE" wait <run-id> --timeout 60
 python3 "$QODER_BRIDGE" show <run-id>
 python3 "$QODER_BRIDGE" check <run-id>
 python3 "$QODER_BRIDGE" list --state pending
+```
+
+`show` 默认只打印元信息、状态、摘要、结构化发现和兼容回答。需要完整输出时：
+
+```bash
+python3 "$QODER_BRIDGE" show --raw <run-id>
+python3 "$QODER_BRIDGE" show --all <run-id>
 ```
 
 ## YOLO 模式
@@ -209,9 +240,12 @@ python3 "$QODER_BRIDGE" send \
   --detach \
   --transport qodercli \
   --yolo \
+  --artifact-protocol \
   --cwd /path/to/project \
   "审查这个 PR，并直接评论高置信度问题"
 ```
+
+这里 `--artifact-protocol` 可以不写，因为 `--detach` / `--yolo` 会自动启用；显式写出来只是更好读。
 
 ## 终端输入模式
 
@@ -304,7 +338,10 @@ Permission confirmation required but no interactive handler is available
 常用文件：
 
 - `user-prompt.md`：原始用户 prompt
-- `response.md`：Qoder 输出
+- `summary.md`：默认读取的精简总结
+- `findings.json`：结构化发现或测试结果
+- `raw_output.txt`：完整原始输出或日志
+- `response.md`：兼容旧流程的最终回答
 - `status.json`：运行状态
 - `metadata.json`：使用的 CLI、命令、时间等元信息
 

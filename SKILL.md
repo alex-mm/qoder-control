@@ -1,6 +1,6 @@
 ---
 name: qoder-control
-description: Control the local Qoder desktop app from Codex by sending prompts through the `qoder chat` CLI and collecting Qoder's answer from a mailbox directory. Use when the user asks Codex to ask Qoder, delegate work to Qoder, compare Qoder's answer with Codex, send a command or prompt to local Qoder, or retrieve Qoder's response from a local file.
+description: Control local Qoder from Codex by sending prompts through qodercli or Qoder chat and collecting mailbox artifacts. Use when the user asks Codex to ask Qoder, delegate work to Qoder, compare Qoder's answer with Codex, send a command or prompt to local Qoder, retrieve Qoder's response, run long Qoder code review or test tasks asynchronously, or inspect Qoder summary/findings/raw output files.
 ---
 
 # Qoder Control
@@ -45,17 +45,21 @@ The bridge creates one run directory under:
 
 Each run contains:
 
-- `prompt.md`: the protocol prompt sent to Qoder
-- `response.md`: Qoder's final answer file
+- `user-prompt.md`: the user's original prompt
+- `prompt.md`: the actual prompt sent to Qoder
+- `summary.md`: concise result for Codex to read by default
+- `findings.json`: structured findings/tests for code review and test tasks
+- `raw_output.txt`: full raw Qoder output, logs, and detailed notes
+- `response.md`: backward-compatible final answer, usually mirroring `summary.md`
 - `status.json`: Qoder's completion signal
 - `metadata.json`: bridge metadata
-- `stdout.txt` / `stderr.txt`: `qoder chat` process output
+- `stdout.txt` / `stderr.txt`: process output captured by the bridge
 
-The bridge tells Qoder to write `response.md.tmp`, rename it to `response.md`, then write `status.json.tmp` and rename it to `status.json`. Treat `status.json` plus an existing `response.md` as the completion signal. Do not treat a partial `response.md.tmp` as complete.
+For detached, YOLO, or app-chat sends, the bridge tells Qoder to write `raw_output.txt`, `summary.md`, `findings.json`, `response.md`, then `status.json`, using `.tmp` files and atomic renames. Treat `status.json` plus an existing `summary.md` or `response.md` as the completion signal. Do not treat partial `.tmp` files as complete.
 
 ## Send A Task
 
-Use `agent` mode by default. With the default `--transport auto`, the bridge requires a logged-in `qodercli` discovered from `--qodercli`, `QODERCLI` / `QODERCLI_PATH`, or `PATH`; it uses `qodercli -p` with the raw user prompt, then captures stdout and writes `response.md` / `status.json` from Codex. If no logged-in qodercli exists, stop and ask the user to fix setup instead of silently switching transports.
+Use `agent` mode by default. With the default `--transport auto`, the bridge requires a logged-in `qodercli` discovered from `--qodercli`, `QODERCLI` / `QODERCLI_PATH`, or `PATH`. For detached/YOLO tasks it sends a mailbox artifact protocol; for short non-YOLO tasks it may send the raw user prompt and let the bridge create fallback artifacts from stdout. If no logged-in qodercli exists, stop and ask the user to fix setup instead of silently switching transports.
 
 For long tasks such as repository/PR code review, use real detached mode so Codex can return immediately and check later:
 
@@ -68,9 +72,9 @@ python3 "$QODER_BRIDGE" send \
   "Review this repository and write findings."
 ```
 
-Detached mode starts a background worker, returns `run_id` immediately, and later writes `response.md` / `status.json`. Use `check`, `show`, or `wait` to inspect it.
+Detached mode starts a background worker, returns `run_id` immediately, and later writes `summary.md`, `findings.json`, `raw_output.txt`, `response.md`, and `status.json`. Use `check`, `show`, or `wait` to inspect it.
 
-After a successful detached send, report the `run_id`, run directory, and exact check/show commands, then stop the current turn. Do not immediately poll, wait, or say "I will keep waiting" unless the user explicitly asks to monitor, wait for completion, or check again later in the same request.
+After a successful detached send, report the `run_id`, run directory, and exact `check`, `show`, and `show --raw` commands, then stop the current turn. Do not immediately poll, wait, or say "I will keep waiting" unless the user explicitly asks to monitor, wait for completion, or check again later in the same request.
 
 ### YOLO Selection Guidance
 
@@ -151,6 +155,18 @@ python3 "$QODER_BRIDGE" send \
 
 `--dangerously-skip-permissions` is kept as a compatibility alias, but prefer `--yolo` in this skill.
 
+For long tasks where token efficiency matters, rely on the artifact protocol:
+
+```bash
+python3 "$QODER_BRIDGE" send \
+  --detach \
+  --transport qodercli \
+  --yolo \
+  --artifact-protocol \
+  --cwd "$PWD" \
+  "Run the e2e suite. Write full logs to raw_output.txt, concise results to summary.md, and test details to findings.json."
+```
+
 If the user wants to watch Qoder answer in their already-open Terminal, and the selected Terminal tab is already running interactive `qodercli`, use `terminal-input`. This types the prompt into that tab and presses return. Codex only records that the prompt was sent; Qoder's output remains in Terminal and is not captured:
 
 ```bash
@@ -160,6 +176,17 @@ python3 "$QODER_BRIDGE" send \
   "你好"
 ```
 
+## Read Artifacts
+
+Default reading order for completed runs:
+
+1. Read `summary.md` first.
+2. Read `findings.json` when the task is CR, tests, or needs structured actions.
+3. Read `raw_output.txt` only when verifying a finding, diagnosing a failure, or the summary is insufficient.
+4. Use `response.md` as a compatibility fallback when `summary.md` is missing.
+
+For CR tasks, report only high-confidence findings with file/line references when present. For e2e tasks, report command, pass/fail status, failed tests, the key error snippet, and the raw log path instead of dumping full logs.
+
 ## Read Existing Runs
 
 Show a run's current state:
@@ -167,6 +194,8 @@ Show a run's current state:
 ```bash
 python3 "$QODER_BRIDGE" show <run-id>
 ```
+
+`show` prints summary and structured findings by default. Use `show --raw <run-id>` to include `raw_output.txt`, or `show --all <run-id>` for every captured artifact.
 
 Use `check` for heartbeat or automation checks. Exit code `0` means complete or blocked with a readable response, `1` means pending, and `2` means Qoder reported an error:
 
@@ -194,14 +223,14 @@ python3 "$QODER_BRIDGE" heartbeat-prompt <run-id>
 
 ## Monitoring
 
-Use a Codex heartbeat when the user asks to monitor a Qoder run or continue this same task later. The heartbeat prompt should call `check <run-id>`, report `response.md` when complete, and stop monitoring after completion.
+Use a Codex heartbeat when the user asks to monitor a Qoder run or continue this same task later. The heartbeat prompt should call `check <run-id>`, report `summary.md` and high-signal `findings.json` content when complete, and stop monitoring after completion.
 
 Use cron automation only for broad recurring scans, such as checking all pending Qoder bridge runs every day. Do not create a long-running shell watcher.
 
 ## Safety Rules
 
 - Prefer this mailbox protocol over scraping Qoder UI state, SQLite tables, or logs.
-- Tell Qoder to write only `response.md` and `status.json` unless the user's request explicitly asks Qoder to modify project files.
+- Tell Qoder to write only the mailbox artifacts (`raw_output.txt`, `summary.md`, `findings.json`, `response.md`, `status.json`) unless the user's request explicitly asks Qoder to modify project files.
 - Use absolute paths for `--cwd`, `--prompt-file`, and `--add-file` when possible.
 - If the bridge times out or `check` returns pending, report the run directory and use `check` or `show` later. Do not assume Qoder failed; it may still be running in the app.
 - If `qoder chat` is missing, run `qoder --help` and report the installed CLI capability instead of inventing another interface.

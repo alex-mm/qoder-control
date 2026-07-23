@@ -1,6 +1,6 @@
 # Qoder Control
 
-Codex skill for sending tasks to a local, logged-in Qoder CLI and collecting results through a mailbox directory.
+Codex skill for sending tasks to a local, logged-in Qoder CLI and collecting layered mailbox artifacts: concise summaries, structured findings, and raw output.
 
 - Agent rules: `SKILL.md`
 - Human usage guide: `USAGE.md`

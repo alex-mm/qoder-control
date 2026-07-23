@@ -14,6 +14,7 @@ from pathlib import Path
 DEFAULT_BRIDGE_DIR = Path.home() / ".codex" / "qoder-bridge"
 SKILL_NAME = "qoder-control"
 DONE_STATUSES = {"done", "blocked", "error"}
+FINDINGS_SCHEMA = "qoder-control.findings.v1"
 
 
 def now_iso() -> str:
@@ -71,6 +72,34 @@ def display_command(command: list[str]) -> list[str]:
 
 def display_text(text: str) -> str:
     return text.replace(str(Path.home()), "$HOME")
+
+
+def combine_process_output(stdout: str, stderr: str, include_stderr: bool = True) -> str:
+    parts = []
+    if stdout.strip():
+        parts.append(stdout.rstrip())
+    if include_stderr and stderr.strip():
+        parts.append("STDERR:\n" + stderr.rstrip())
+    return "\n\n".join(parts).strip()
+
+
+def empty_findings(summary: str = "") -> dict:
+    return {
+        "schema": FINDINGS_SCHEMA,
+        "summary": summary,
+        "findings": [],
+        "tests": [],
+    }
+
+
+def artifact_paths(rdir: Path) -> dict[str, Path]:
+    return {
+        "raw_output": rdir / "raw_output.txt",
+        "summary": rdir / "summary.md",
+        "findings": rdir / "findings.json",
+        "response": rdir / "response.md",
+        "status": rdir / "status.json",
+    }
 
 
 def qoder_path(explicit: str | None) -> str:
@@ -211,7 +240,15 @@ def load_prompt(args: argparse.Namespace) -> str:
     raise SystemExit("provide a prompt argument, --prompt-file, or stdin")
 
 
-def build_protocol_prompt(user_prompt: str, cwd: Path, response_path: Path, status_path: Path) -> str:
+def build_protocol_prompt(user_prompt: str, cwd: Path, paths: dict[str, Path]) -> str:
+    raw_output_path = paths["raw_output"]
+    summary_path = paths["summary"]
+    findings_path = paths["findings"]
+    response_path = paths["response"]
+    status_path = paths["status"]
+    raw_output_tmp = raw_output_path.with_suffix(raw_output_path.suffix + ".tmp")
+    summary_tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
+    findings_tmp = findings_path.with_suffix(findings_path.suffix + ".tmp")
     response_tmp = response_path.with_suffix(response_path.suffix + ".tmp")
     status_tmp = status_path.with_suffix(status_path.suffix + ".tmp")
     return f"""You are Qoder, invoked by Codex through a local mailbox protocol.
@@ -223,34 +260,81 @@ Task from Codex:
 {user_prompt}
 
 Return protocol:
-1. Write your final answer in Markdown to this temporary file:
-{response_tmp}
+1. Write full raw details, command output, review notes, or log excerpts to this temporary file:
+{raw_output_tmp}
 2. Atomically rename it to this exact file:
-{response_path}
-3. Write valid JSON to this temporary file:
-{status_tmp}
+{raw_output_path}
+3. Write a concise Markdown summary for Codex to read by default to this temporary file:
+{summary_tmp}
 4. Atomically rename it to this exact file:
+{summary_path}
+5. Write valid JSON findings to this temporary file:
+{findings_tmp}
+6. Atomically rename it to this exact file:
+{findings_path}
+7. Write a backward-compatible Markdown final answer to this temporary file:
+{response_tmp}
+8. Atomically rename it to this exact file:
+{response_path}
+9. Write valid JSON status to this temporary file:
+{status_tmp}
+10. Atomically rename it to this exact file:
 {status_path}
-5. The JSON must include:
+11. status.json must include:
    {{"status":"done"|"blocked"|"error","summary":"one short sentence","wrote_at":"ISO-8601 timestamp"}}
 
+findings.json format:
+{{
+  "schema": "{FINDINGS_SCHEMA}",
+  "summary": "one short sentence",
+  "findings": [
+    {{
+      "severity": "critical|high|medium|low|info",
+      "title": "short issue title",
+      "file": "path or URL if applicable",
+      "line": null,
+      "body": "actionable details",
+      "confidence": "high|medium|low"
+    }}
+  ],
+  "tests": [
+    {{
+      "command": "command that was run",
+      "status": "passed|failed|skipped|error",
+      "exit_code": null,
+      "summary": "short test result",
+      "log_path": "path to full log if available"
+    }}
+  ]
+}}
+
 Constraints:
-- Unless the task explicitly asks you to modify project files, write only the two files above.
-- If you need to report a blocker, still write response.md and status.json with status "blocked".
+- Unless the task explicitly asks you to modify project files, write only the five mailbox files above.
+- Keep summary.md small and decision-oriented. Put long logs and detailed notes in raw_output.txt.
+- If there are no findings or tests, still write findings.json with empty arrays.
+- response.md should mirror summary.md unless the user explicitly requested a different final artifact.
+- If you need to report a blocker, still write raw_output.txt, summary.md, findings.json, response.md, and status.json with status "blocked".
 - Do not ask Codex to copy content from the Qoder UI. The file response is the interface.
-- Write status.json only after response.md is complete and renamed into place.
+- Write status.json only after all other mailbox files are complete and renamed into place.
 """
 
 
 def read_completion(base: Path, rid: str) -> tuple[bool, dict, str]:
     rdir = run_dir(base, rid)
-    status_path = rdir / "status.json"
-    response_path = rdir / "response.md"
+    paths = artifact_paths(rdir)
+    status_path = paths["status"]
+    response_path = paths["response"]
+    summary_path = paths["summary"]
+    raw_output_path = paths["raw_output"]
+    findings_path = paths["findings"]
     metadata_path = rdir / "metadata.json"
     result = {
         "run_id": rid,
         "run_dir": display_path(rdir),
         "status_path": display_path(status_path),
+        "summary_path": display_path(summary_path),
+        "findings_path": display_path(findings_path),
+        "raw_output_path": display_path(raw_output_path),
         "response_path": display_path(response_path),
         "state": "pending",
     }
@@ -275,16 +359,22 @@ def read_completion(base: Path, rid: str) -> tuple[bool, dict, str]:
     except Exception as exc:
         result.update({"state": "invalid_status", "error": str(exc)})
         return False, result, ""
+    summary_text = read_text_file(summary_path) if summary_path.exists() else ""
     response_text = read_text_file(response_path) if response_path.exists() else ""
+    preferred_text = summary_text or response_text
     status_value = str(status.get("status", "")).strip().lower()
-    complete = bool(response_path.exists() and status_value in DONE_STATUSES)
+    complete = bool(preferred_text and status_value in DONE_STATUSES)
     result.update({
         "state": "complete" if complete else "invalid_completion",
         "status": status,
+        "has_summary": summary_path.exists(),
+        "has_findings": findings_path.exists(),
+        "has_raw_output": raw_output_path.exists(),
         "has_response": response_path.exists(),
+        "summary_bytes": len(summary_text.encode("utf-8")),
         "response_bytes": len(response_text.encode("utf-8")),
     })
-    return complete, result, response_text
+    return complete, result, preferred_text
 
 
 def print_completion(result: dict, response_text: str, as_json: bool) -> None:
@@ -295,16 +385,22 @@ def print_completion(result: dict, response_text: str, as_json: bool) -> None:
     status = result.get("status", result)
     print(json.dumps(status, ensure_ascii=False, indent=2))
     if response_text:
-        print("\nRESPONSE:")
+        print("\nSUMMARY:")
         print(response_text.rstrip())
 
 
-def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, Path, Path, str, list[str], dict, bool]:
+def use_artifact_protocol(args: argparse.Namespace, qoder_kind: str) -> bool:
+    if qoder_kind == "terminal-input":
+        return False
+    if qoder_kind == "qoder-app-chat":
+        return True
+    return bool(args.artifact_protocol or args.detach or args.yolo or args.dangerously_skip_permissions)
+
+
+def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, dict[str, Path], str, list[str], dict, bool]:
     cwd = Path(args.cwd or os.getcwd()).expanduser().resolve()
     prompt = load_prompt(args)
-    response_path = rdir / "response.md"
-    status_path = rdir / "status.json"
-    protocol_prompt = build_protocol_prompt(prompt, cwd, response_path, status_path)
+    paths = artifact_paths(rdir)
 
     transport = args.transport
     qodercli = qodercli_path(args.qodercli) if transport in {"auto", "qodercli"} else None
@@ -330,11 +426,21 @@ def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, Pat
         command = [qoder, "chat", "--mode", args.mode, "--reuse-window"]
         for add_file in args.add_file or []:
             command.extend(["--add-file", str(Path(add_file).expanduser())])
-        command.append(protocol_prompt)
+        command.append(prompt)
         qoder_kind = "qoder-app-chat"
 
+    artifact_protocol = use_artifact_protocol(args, qoder_kind)
+    protocol_prompt = build_protocol_prompt(prompt, cwd, paths)
+    actual_prompt = protocol_prompt if artifact_protocol else prompt
+    if qoder_kind == "terminal-input":
+        command = terminal_input_command(actual_prompt)
+    elif use_qodercli:
+        command[-1] = actual_prompt
+    elif qoder_kind == "qoder-app-chat":
+        command[-1] = actual_prompt
+
     (rdir / "user-prompt.md").write_text(prompt, encoding="utf-8")
-    (rdir / "prompt.md").write_text(protocol_prompt if qoder_kind == "qoder-app-chat" else prompt, encoding="utf-8")
+    (rdir / "prompt.md").write_text(actual_prompt, encoding="utf-8")
 
     metadata = {
         "skill": SKILL_NAME,
@@ -346,11 +452,15 @@ def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, Pat
         "qoder": display_path(qoder),
         "qoder_kind": qoder_kind,
         "qoder_version": qoder_version(qoder),
-        "response_path": display_path(response_path),
-        "status_path": display_path(status_path),
+        "artifact_protocol": artifact_protocol,
+        "raw_output_path": display_path(paths["raw_output"]),
+        "summary_path": display_path(paths["summary"]),
+        "findings_path": display_path(paths["findings"]),
+        "response_path": display_path(paths["response"]),
+        "status_path": display_path(paths["status"]),
         "command": display_command(command[:-1]) + ["<prompt>"],
     }
-    return cwd, response_path, status_path, qoder_kind, command, metadata, use_qodercli
+    return cwd, paths, qoder_kind, command, metadata, use_qodercli
 
 
 def finalize_run(
@@ -361,45 +471,69 @@ def finalize_run(
     returncode: int,
     qoder_kind: str,
     use_qodercli: bool,
-    response_path: Path,
-    status_path: Path,
+    paths: dict[str, Path],
 ) -> None:
     (rdir / "stdout.txt").write_text(stdout or "", encoding="utf-8")
     (rdir / "stderr.txt").write_text(stderr or "", encoding="utf-8")
+    raw_output_path = paths["raw_output"]
+    summary_path = paths["summary"]
+    findings_path = paths["findings"]
+    response_path = paths["response"]
+    status_path = paths["status"]
+    raw_output = combine_process_output(stdout or "", stderr or "", include_stderr=True)
+    fallback_summary = raw_output or "(qodercli returned no output)"
     metadata["qoder_chat_exit_code"] = returncode
     metadata["finished_at"] = now_iso()
     metadata["worker_state"] = "finished"
 
     if qoder_kind == "terminal-input" and not status_path.exists():
+        message = "Sent prompt to the selected Terminal tab. Output is visible in Terminal and is not captured by Codex.\n"
+        write_text_atomic(raw_output_path, message)
+        write_text_atomic(summary_path, message)
+        write_json_atomic(findings_path, empty_findings("prompt sent to Terminal"))
         write_text_atomic(
             response_path,
-            "Sent prompt to the selected Terminal tab. Output is visible in Terminal and is not captured by Codex.\n",
+            message,
         )
         write_json_atomic(status_path, {
             "status": "done" if returncode == 0 else "error",
             "summary": "prompt sent to Terminal" if returncode == 0 else "failed to send prompt to Terminal",
             "wrote_at": now_iso(),
         })
-    elif use_qodercli and not status_path.exists():
-        output = (stdout or "").strip()
-        if returncode != 0:
-            output = "\n".join(part for part in [output, (stderr or "").strip()] if part)
-        write_text_atomic(response_path, (output or "(qodercli returned no output)") + "\n")
-        write_json_atomic(status_path, {
-            "status": "done" if returncode == 0 else "error",
-            "summary": "qodercli completed" if returncode == 0 else "qodercli failed",
-            "wrote_at": now_iso(),
-        })
+    elif use_qodercli:
+        if not raw_output_path.exists():
+            write_text_atomic(raw_output_path, fallback_summary + "\n")
+        if not summary_path.exists():
+            existing_response = read_text_file(response_path).strip() if response_path.exists() else ""
+            write_text_atomic(summary_path, (existing_response or fallback_summary) + "\n")
+        if not findings_path.exists():
+            write_json_atomic(findings_path, empty_findings("qodercli completed" if returncode == 0 else "qodercli failed"))
+        if not response_path.exists():
+            write_text_atomic(response_path, read_text_file(summary_path))
+        if not status_path.exists():
+            write_json_atomic(status_path, {
+                "status": "done" if returncode == 0 else "error",
+                "summary": "qodercli completed" if returncode == 0 else "qodercli failed",
+                "wrote_at": now_iso(),
+            })
     elif qoder_kind == "qoder-app-chat" and not status_path.exists():
-        write_text_atomic(
-            response_path,
-            "Desktop qoder chat was launched, but no mailbox response was written. Use headless qodercli for reliable async results.\n",
-        )
+        message = "Desktop qoder chat was launched, but no mailbox response was written. Use headless qodercli for reliable async results.\n"
+        write_text_atomic(raw_output_path, message)
+        write_text_atomic(summary_path, message)
+        write_json_atomic(findings_path, empty_findings("desktop app-chat did not produce a mailbox response"))
+        write_text_atomic(response_path, message)
         write_json_atomic(status_path, {
             "status": "blocked",
             "summary": "desktop app-chat did not produce a mailbox response",
             "wrote_at": now_iso(),
         })
+    else:
+        if not raw_output_path.exists():
+            write_text_atomic(raw_output_path, fallback_summary + "\n")
+        if not summary_path.exists() and response_path.exists():
+            write_text_atomic(summary_path, read_text_file(response_path))
+        if not findings_path.exists():
+            write_json_atomic(findings_path, empty_findings())
 
     write_json(rdir / "metadata.json", metadata)
 
@@ -410,7 +544,7 @@ def send(args: argparse.Namespace) -> int:
     rdir = run_dir(base, rid)
     rdir.mkdir(parents=True, exist_ok=False)
 
-    cwd, response_path, status_path, qoder_kind, command, metadata, use_qodercli = build_run(args, rid, rdir)
+    cwd, paths, qoder_kind, command, metadata, use_qodercli = build_run(args, rid, rdir)
     write_json(rdir / "metadata.json", metadata)
 
     if args.detach:
@@ -419,8 +553,7 @@ def send(args: argparse.Namespace) -> int:
             "command": command,
             "qoder_kind": qoder_kind,
             "use_qodercli": use_qodercli,
-            "response_path": str(response_path),
-            "status_path": str(status_path),
+            "artifact_paths": {key: str(path) for key, path in paths.items()},
         }
         write_json(rdir / "worker_config.json", worker_config)
         worker_out = open(rdir / "worker.stdout.txt", "ab")
@@ -455,8 +588,11 @@ def send(args: argparse.Namespace) -> int:
         print(json.dumps({
             "run_id": rid,
             "run_dir": display_path(rdir),
-            "status_path": display_path(status_path),
-            "response_path": display_path(response_path),
+            "status_path": display_path(paths["status"]),
+            "summary_path": display_path(paths["summary"]),
+            "findings_path": display_path(paths["findings"]),
+            "raw_output_path": display_path(paths["raw_output"]),
+            "response_path": display_path(paths["response"]),
             "detached": True,
             "worker_pid": proc.pid,
             "state": "pending",
@@ -472,15 +608,17 @@ def send(args: argparse.Namespace) -> int:
         proc.returncode,
         qoder_kind,
         use_qodercli,
-        response_path,
-        status_path,
+        paths,
     )
 
     print(json.dumps({
         "run_id": rid,
         "run_dir": display_path(rdir),
-        "status_path": display_path(status_path),
-        "response_path": display_path(response_path),
+        "status_path": display_path(paths["status"]),
+        "summary_path": display_path(paths["summary"]),
+        "findings_path": display_path(paths["findings"]),
+        "raw_output_path": display_path(paths["raw_output"]),
+        "response_path": display_path(paths["response"]),
         "qoder_chat_exit_code": proc.returncode,
     }, ensure_ascii=False, indent=2))
 
@@ -508,6 +646,13 @@ def run_worker(args: argparse.Namespace) -> int:
             capture_output=True,
         )
         metadata = json.loads(read_text_file(metadata_path)) if metadata_path.exists() else metadata
+        config_paths = config.get("artifact_paths") or {
+            "raw_output": str(rdir / "raw_output.txt"),
+            "summary": str(rdir / "summary.md"),
+            "findings": str(rdir / "findings.json"),
+            "response": config.get("response_path", str(rdir / "response.md")),
+            "status": config.get("status_path", str(rdir / "status.json")),
+        }
         finalize_run(
             rdir,
             metadata,
@@ -516,13 +661,20 @@ def run_worker(args: argparse.Namespace) -> int:
             proc.returncode,
             config["qoder_kind"],
             bool(config.get("use_qodercli")),
-            Path(config["response_path"]),
-            Path(config["status_path"]),
+            {key: Path(value) for key, value in config_paths.items()},
         )
         return proc.returncode
     except Exception as exc:
-        response_path = rdir / "response.md"
-        status_path = rdir / "status.json"
+        paths = artifact_paths(rdir)
+        response_path = paths["response"]
+        status_path = paths["status"]
+        summary_path = paths["summary"]
+        raw_output_path = paths["raw_output"]
+        findings_path = paths["findings"]
+        message = f"Qoder bridge worker failed: {exc}\n"
+        write_text_atomic(raw_output_path, message)
+        write_text_atomic(summary_path, message)
+        write_json_atomic(findings_path, empty_findings("qoder bridge worker failed"))
         write_text_atomic(response_path, f"Qoder bridge worker failed: {exc}\n")
         write_json_atomic(status_path, {
             "status": "error",
@@ -575,7 +727,16 @@ def show(args: argparse.Namespace) -> int:
     if not rdir.exists():
         print(f"run not found: {display_path(rdir)}", file=sys.stderr)
         return 2
-    for name in ["metadata.json", "status.json", "response.md", "stderr.txt", "stdout.txt", "prompt.md"]:
+    names = ["metadata.json", "status.json", "summary.md", "findings.json", "response.md"]
+    if args.raw:
+        names.append("raw_output.txt")
+    if args.all:
+        names.extend(["raw_output.txt", "stderr.txt", "stdout.txt", "worker.stderr.txt", "worker.stdout.txt", "prompt.md", "user-prompt.md"])
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
         path = rdir / name
         if path.exists():
             print(f"\n== {name} ==")
@@ -662,7 +823,7 @@ Use:
 QODER_BRIDGE="{script_path}"
 python3 "$QODER_BRIDGE" check {args.run_id}
 
-If complete, report Qoder's `response.md` content to the user and stop monitoring. If pending, say it is still pending and schedule/check again later only if the user requested continued monitoring.
+If complete, report `summary.md` and high-signal items from `findings.json` to the user, then stop monitoring. Read `raw_output.txt` only when the summary or findings need verification. If pending, say it is still pending and schedule/check again later only if the user requested continued monitoring.
 """
     print(prompt)
     return 0
@@ -685,6 +846,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--run-id", help="Optional caller-provided run id.")
     s.add_argument("--max-turns", type=int, default=25, help="Max qodercli agent turns for --transport qodercli.")
     s.add_argument("--max-output-tokens", default="16k", choices=["16k", "32k"], help="Max qodercli output tokens.")
+    s.add_argument("--artifact-protocol", action="store_true", help="Ask Qoder to write raw_output.txt, summary.md, findings.json, response.md, and status.json. Enabled automatically for --detach/--yolo/app-chat.")
     s.add_argument("--yolo", action="store_true", help="Alias for --dangerously-skip-permissions; fully bypass qodercli permission checks.")
     s.add_argument("--dangerously-skip-permissions", action="store_true", help="Pass through to qodercli for fully authorized local automation.")
     s.add_argument("--detach", action="store_true", help="Start Qoder in a background worker and return run_id immediately.")
@@ -707,6 +869,8 @@ def parser() -> argparse.ArgumentParser:
 
     sh = sub.add_parser("show")
     sh.add_argument("run_id")
+    sh.add_argument("--raw", action="store_true", help="Also print raw_output.txt.")
+    sh.add_argument("--all", action="store_true", help="Print every captured artifact, including stdout/stderr and prompts.")
     sh.set_defaults(func=show)
 
     ls = sub.add_parser("list")
