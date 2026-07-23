@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qoder Control"
+  short_description: "Send prompts to local Qoder and collect file replies"
+  default_prompt: "Use $qoder-control to ask local Qoder for a second pass and read its file response."
