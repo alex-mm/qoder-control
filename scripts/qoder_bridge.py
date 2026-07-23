@@ -15,6 +15,13 @@ DEFAULT_BRIDGE_DIR = Path.home() / ".codex" / "qoder-bridge"
 SKILL_NAME = "qoder-control"
 DONE_STATUSES = {"done", "blocked", "error"}
 FINDINGS_SCHEMA = "qoder-control.findings.v1"
+ARTIFACT_PROFILE_CHOICES = ("auto", "none", "minimal", "review", "test", "full")
+PROFILE_OUTPUTS = {
+    "minimal": ("summary",),
+    "review": ("summary", "findings"),
+    "test": ("summary", "findings"),
+    "full": ("raw_output", "summary", "findings", "response"),
+}
 
 
 def now_iso() -> str:
@@ -100,6 +107,34 @@ def artifact_paths(rdir: Path) -> dict[str, Path]:
         "response": rdir / "response.md",
         "status": rdir / "status.json",
     }
+
+
+def contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def infer_artifact_profile(args: argparse.Namespace, prompt: str, qoder_kind: str) -> str:
+    explicit = getattr(args, "artifact_profile", "auto")
+    if explicit != "auto":
+        return explicit
+    if getattr(args, "artifact_protocol", False):
+        return "full"
+    if qoder_kind == "terminal-input":
+        return "none"
+    if qoder_kind == "qoder-app-chat":
+        return "minimal"
+    needs_protocol = bool(args.detach or args.yolo or args.dangerously_skip_permissions)
+    if not needs_protocol:
+        return "none"
+
+    text = prompt.lower()
+    if contains_any(text, ("raw_output", "full log", "full logs", "full artifact", "debug artifact", "完整日志", "完整输出", "调试")):
+        return "full"
+    if contains_any(text, ("e2e", "test", "tests", "playwright", "cypress", "jest", "pytest", "vitest", "测试", "用例")):
+        return "test"
+    if contains_any(text, ("code review", "review this pr", "pr review", "pull request", "review", "cr ", " cr", "代码审查", "审查", "评审")):
+        return "review"
+    return "minimal"
 
 
 def qoder_path(explicit: str | None) -> str:
@@ -240,49 +275,89 @@ def load_prompt(args: argparse.Namespace) -> str:
     raise SystemExit("provide a prompt argument, --prompt-file, or stdin")
 
 
-def build_protocol_prompt(user_prompt: str, cwd: Path, paths: dict[str, Path]) -> str:
-    raw_output_path = paths["raw_output"]
-    summary_path = paths["summary"]
-    findings_path = paths["findings"]
-    response_path = paths["response"]
+def artifact_description(key: str, profile: str) -> str:
+    if key == "summary":
+        return "a concise Markdown summary for Codex to read by default"
+    if key == "findings" and profile == "test":
+        return "valid JSON test results and any actionable findings"
+    if key == "findings":
+        return "valid JSON review findings and any test results"
+    if key == "raw_output":
+        return "full raw details, command output, review notes, or log excerpts"
+    if key == "response":
+        return "a backward-compatible Markdown final answer, usually mirroring summary.md"
+    raise ValueError(f"unknown artifact key: {key}")
+
+
+def artifact_write_steps(profile: str, paths: dict[str, Path]) -> str:
+    lines: list[str] = []
+    step = 1
+    for key in PROFILE_OUTPUTS[profile]:
+        path = paths[key]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        lines.extend([
+            f"{step}. Write {artifact_description(key, profile)} to this temporary file:",
+            str(tmp),
+        ])
+        step += 1
+        lines.extend([
+            f"{step}. Atomically rename it to this exact file:",
+            str(path),
+        ])
+        step += 1
     status_path = paths["status"]
-    raw_output_tmp = raw_output_path.with_suffix(raw_output_path.suffix + ".tmp")
-    summary_tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
-    findings_tmp = findings_path.with_suffix(findings_path.suffix + ".tmp")
-    response_tmp = response_path.with_suffix(response_path.suffix + ".tmp")
     status_tmp = status_path.with_suffix(status_path.suffix + ".tmp")
-    return f"""You are Qoder, invoked by Codex through a local mailbox protocol.
+    lines.extend([
+        f"{step}. Write valid JSON status to this temporary file:",
+        str(status_tmp),
+    ])
+    step += 1
+    lines.extend([
+        f"{step}. Atomically rename it to this exact file:",
+        str(status_path),
+    ])
+    return "\n".join(lines)
 
-Working directory:
-{cwd}
 
-Task from Codex:
-{user_prompt}
+def profile_constraints(profile: str) -> str:
+    common = [
+        "- Keep summary.md small and decision-oriented.",
+        "- Do not ask Codex to copy content from the Qoder UI. The file response is the interface.",
+        "- Write status.json only after every requested mailbox artifact is complete and renamed into place.",
+    ]
+    if profile == "minimal":
+        specific = [
+            "- Write only summary.md and status.json. The bridge creates raw_output.txt, findings.json, and response.md fallbacks.",
+            "- Put only the final result, blocker, or next action in summary.md.",
+        ]
+    elif profile == "review":
+        specific = [
+            "- Write only summary.md, findings.json, and status.json. The bridge creates raw_output.txt and response.md fallbacks.",
+            "- Put actionable issues in findings.json. Keep long reasoning out of summary.md.",
+            "- If there are no high-confidence findings, write findings.json with an empty findings array.",
+        ]
+    elif profile == "test":
+        specific = [
+            "- Write only summary.md, findings.json, and status.json. The bridge creates raw_output.txt and response.md fallbacks.",
+            "- Put test commands, status, exit codes, failed cases, short error snippets, and log paths in findings.json.tests.",
+            "- Do not copy long logs into mailbox files; reference the log path instead.",
+        ]
+    elif profile == "full":
+        specific = [
+            "- Write all requested mailbox artifacts.",
+            "- Keep summary.md small. Put long logs and detailed notes in raw_output.txt.",
+            "- If there are no findings or tests, still write findings.json with empty arrays.",
+            "- response.md should mirror summary.md unless the user explicitly requested a different final artifact.",
+        ]
+    else:
+        raise ValueError(f"unsupported artifact profile: {profile}")
+    return "\n".join(specific + common)
 
-Return protocol:
-1. Write full raw details, command output, review notes, or log excerpts to this temporary file:
-{raw_output_tmp}
-2. Atomically rename it to this exact file:
-{raw_output_path}
-3. Write a concise Markdown summary for Codex to read by default to this temporary file:
-{summary_tmp}
-4. Atomically rename it to this exact file:
-{summary_path}
-5. Write valid JSON findings to this temporary file:
-{findings_tmp}
-6. Atomically rename it to this exact file:
-{findings_path}
-7. Write a backward-compatible Markdown final answer to this temporary file:
-{response_tmp}
-8. Atomically rename it to this exact file:
-{response_path}
-9. Write valid JSON status to this temporary file:
-{status_tmp}
-10. Atomically rename it to this exact file:
-{status_path}
-11. status.json must include:
-   {{"status":"done"|"blocked"|"error","summary":"one short sentence","wrote_at":"ISO-8601 timestamp"}}
 
+def findings_schema_section(profile: str) -> str:
+    if "findings" not in PROFILE_OUTPUTS[profile]:
+        return ""
+    return f"""
 findings.json format:
 {{
   "schema": "{FINDINGS_SCHEMA}",
@@ -307,15 +382,30 @@ findings.json format:
     }}
   ]
 }}
+"""
+
+
+def build_protocol_prompt(user_prompt: str, cwd: Path, paths: dict[str, Path], profile: str) -> str:
+    return f"""You are Qoder, invoked by Codex through a local mailbox protocol.
+
+Artifact profile:
+{profile}
+
+Working directory:
+{cwd}
+
+Task from Codex:
+{user_prompt}
+
+Return protocol:
+{artifact_write_steps(profile, paths)}
+
+status.json must include:
+   {{"status":"done"|"blocked"|"error","summary":"one short sentence","wrote_at":"ISO-8601 timestamp"}}
+{findings_schema_section(profile)}
 
 Constraints:
-- Unless the task explicitly asks you to modify project files, write only the five mailbox files above.
-- Keep summary.md small and decision-oriented. Put long logs and detailed notes in raw_output.txt.
-- If there are no findings or tests, still write findings.json with empty arrays.
-- response.md should mirror summary.md unless the user explicitly requested a different final artifact.
-- If you need to report a blocker, still write raw_output.txt, summary.md, findings.json, response.md, and status.json with status "blocked".
-- Do not ask Codex to copy content from the Qoder UI. The file response is the interface.
-- Write status.json only after all other mailbox files are complete and renamed into place.
+{profile_constraints(profile)}
 """
 
 
@@ -350,6 +440,7 @@ def read_completion(base: Path, rid: str) -> tuple[bool, dict, str]:
                     "worker_pid": metadata.get("worker_pid"),
                     "worker_state": metadata.get("worker_state"),
                     "qoder_kind": metadata.get("qoder_kind"),
+                    "artifact_profile": metadata.get("artifact_profile"),
                 })
             except Exception:
                 pass
@@ -389,14 +480,6 @@ def print_completion(result: dict, response_text: str, as_json: bool) -> None:
         print(response_text.rstrip())
 
 
-def use_artifact_protocol(args: argparse.Namespace, qoder_kind: str) -> bool:
-    if qoder_kind == "terminal-input":
-        return False
-    if qoder_kind == "qoder-app-chat":
-        return True
-    return bool(args.artifact_protocol or args.detach or args.yolo or args.dangerously_skip_permissions)
-
-
 def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, dict[str, Path], str, list[str], dict, bool]:
     cwd = Path(args.cwd or os.getcwd()).expanduser().resolve()
     prompt = load_prompt(args)
@@ -429,8 +512,9 @@ def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, dic
         command.append(prompt)
         qoder_kind = "qoder-app-chat"
 
-    artifact_protocol = use_artifact_protocol(args, qoder_kind)
-    protocol_prompt = build_protocol_prompt(prompt, cwd, paths)
+    artifact_profile = infer_artifact_profile(args, prompt, qoder_kind)
+    artifact_protocol = artifact_profile != "none"
+    protocol_prompt = build_protocol_prompt(prompt, cwd, paths, artifact_profile) if artifact_protocol else ""
     actual_prompt = protocol_prompt if artifact_protocol else prompt
     if qoder_kind == "terminal-input":
         command = terminal_input_command(actual_prompt)
@@ -453,6 +537,7 @@ def build_run(args: argparse.Namespace, rid: str, rdir: Path) -> tuple[Path, dic
         "qoder_kind": qoder_kind,
         "qoder_version": qoder_version(qoder),
         "artifact_protocol": artifact_protocol,
+        "artifact_profile": artifact_profile,
         "raw_output_path": display_path(paths["raw_output"]),
         "summary_path": display_path(paths["summary"]),
         "findings_path": display_path(paths["findings"]),
@@ -553,6 +638,7 @@ def send(args: argparse.Namespace) -> int:
             "command": command,
             "qoder_kind": qoder_kind,
             "use_qodercli": use_qodercli,
+            "artifact_profile": metadata.get("artifact_profile"),
             "artifact_paths": {key: str(path) for key, path in paths.items()},
         }
         write_json(rdir / "worker_config.json", worker_config)
@@ -593,6 +679,7 @@ def send(args: argparse.Namespace) -> int:
             "findings_path": display_path(paths["findings"]),
             "raw_output_path": display_path(paths["raw_output"]),
             "response_path": display_path(paths["response"]),
+            "artifact_profile": metadata.get("artifact_profile"),
             "detached": True,
             "worker_pid": proc.pid,
             "state": "pending",
@@ -619,6 +706,7 @@ def send(args: argparse.Namespace) -> int:
         "findings_path": display_path(paths["findings"]),
         "raw_output_path": display_path(paths["raw_output"]),
         "response_path": display_path(paths["response"]),
+        "artifact_profile": metadata.get("artifact_profile"),
         "qoder_chat_exit_code": proc.returncode,
     }, ensure_ascii=False, indent=2))
 
@@ -846,7 +934,8 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--run-id", help="Optional caller-provided run id.")
     s.add_argument("--max-turns", type=int, default=25, help="Max qodercli agent turns for --transport qodercli.")
     s.add_argument("--max-output-tokens", default="16k", choices=["16k", "32k"], help="Max qodercli output tokens.")
-    s.add_argument("--artifact-protocol", action="store_true", help="Ask Qoder to write raw_output.txt, summary.md, findings.json, response.md, and status.json. Enabled automatically for --detach/--yolo/app-chat.")
+    s.add_argument("--artifact-profile", choices=ARTIFACT_PROFILE_CHOICES, default="auto", help="Mailbox artifact profile. auto chooses none/minimal/review/test/full from transport and prompt.")
+    s.add_argument("--artifact-protocol", action="store_true", help="Deprecated compatibility alias for --artifact-profile full when --artifact-profile is auto.")
     s.add_argument("--yolo", action="store_true", help="Alias for --dangerously-skip-permissions; fully bypass qodercli permission checks.")
     s.add_argument("--dangerously-skip-permissions", action="store_true", help="Pass through to qodercli for fully authorized local automation.")
     s.add_argument("--detach", action="store_true", help="Start Qoder in a background worker and return run_id immediately.")

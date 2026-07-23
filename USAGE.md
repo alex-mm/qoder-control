@@ -10,7 +10,7 @@
 
 - 同步后台模式：Codex 调用 `qodercli -p`，等待 Qoder 完成，拿到输出后再展示给你。
 - 真异步模式：Codex 提交后立刻返回 `run_id`，Qoder 在后台跑，之后再查询状态。
-- 分层产物：长任务会分别保存完整原始输出、精简总结和结构化发现，避免 Codex 默认读取大日志。
+- 智能分层产物：按任务选择 `minimal/review/test/full`，只要求 Qoder 写必要文件，bridge 自动补齐兼容和原始输出归档。
 - YOLO 模式：后台模式的完全放权版本，Qoder 执行工具时不再要求权限确认。
 - 终端输入模式：Codex 把 prompt 直接打进你当前打开的 Terminal，让你在终端里看 Qoder 输出。
 - 桌面投递模式：使用 `qoder chat --reuse-window` 投递到 Qoder 桌面窗口，仅作为特殊 fallback。
@@ -79,7 +79,8 @@ python3 "$QODER_BRIDGE" --qodercli /absolute/path/to/qodercli status
 - `--wait`：当前命令会等 Qoder 完成。
 - `--detach`：当前命令只提交任务，立刻返回 `run_id`。
 - `--yolo`：只控制是否绕过 Qoder 权限确认，不控制同步/异步。
-- `--artifact-protocol`：要求 Qoder 写分层产物；`--detach`、`--yolo`、`app-chat` 会自动启用。
+- `--artifact-profile auto|minimal|review|test|full|none`：控制 Qoder 需要写哪些 mailbox 文件；默认 `auto`。
+- `--artifact-protocol`：旧兼容参数，等价于在 `auto` 下强制使用 `full`。
 - 不加 `--wait` 也不加 `--detach`：命令仍会等 `qodercli -p` 进程结束，只是不额外轮询；这不是真异步。
 - `--detach` 返回后，Codex 默认应该停止当前回合，只给你 `run_id` 和查询命令；只有你明确说“帮我盯着/等结果/继续查”，它才继续轮询。
 
@@ -91,18 +92,36 @@ python3 "$QODER_BRIDGE" --qodercli /absolute/path/to/qodercli status
 ~/.codex/qoder-bridge/runs/<run-id>/
 ```
 
-常用文件：
+常用文件通常都会存在，但不一定都由 Qoder 亲自写：
 
 - `summary.md`：给 Codex 默认读取的精简结论。
 - `findings.json`：结构化问题、测试结果、命令退出码等。
-- `raw_output.txt`：完整原始输出、长日志、详细审查记录。
-- `response.md`：兼容旧版本的最终回答，通常等同于 `summary.md`。
+- `raw_output.txt`：bridge 捕获的原始 stdout/stderr；`full` 模式下也可由 Qoder 写详细记录。
+- `response.md`：兼容旧版本的最终回答，通常由 bridge 从 `summary.md` 自动生成。
 - `status.json`：完成状态。
 - `stdout.txt` / `stderr.txt`：bridge 捕获到的进程输出。
 - `user-prompt.md`：你最初发给 Qoder 的 prompt。
 - `prompt.md`：实际发给 Qoder 的 prompt，长任务里会包含 mailbox 协议。
 
 Codex 默认应该只读 `summary.md` 和 `findings.json`。只有需要复核、定位失败、或总结不够时，才读 `raw_output.txt`。
+
+Artifact profile：
+
+| Profile | Qoder 需要写 | 适合场景 |
+| --- | --- | --- |
+| `none` | 不写 mailbox，bridge 捕获 stdout | 短问答 |
+| `minimal` | `summary.md`、`status.json` | 普通长任务 |
+| `review` | `summary.md`、`findings.json`、`status.json` | CR / PR review |
+| `test` | `summary.md`、`findings.json.tests`、`status.json` | e2e / 单测 / 集成测试 |
+| `full` | 全部 mailbox 文件 | 调试 bridge 或确实需要完整原始产物 |
+
+`auto` 规则：
+
+- 短任务默认 `none`。
+- `--detach` / `--yolo` 普通任务默认 `minimal`。
+- prompt 像 CR / PR review 时用 `review`。
+- prompt 像 e2e / test 时用 `test`。
+- 明确要完整日志、完整输出、调试时用 `full`。
 
 ## 同步后台模式
 
@@ -240,12 +259,12 @@ python3 "$QODER_BRIDGE" send \
   --detach \
   --transport qodercli \
   --yolo \
-  --artifact-protocol \
+  --artifact-profile review \
   --cwd /path/to/project \
   "审查这个 PR，并直接评论高置信度问题"
 ```
 
-这里 `--artifact-protocol` 可以不写，因为 `--detach` / `--yolo` 会自动启用；显式写出来只是更好读。
+这里 `--artifact-profile review` 可以不写，因为 `auto` 通常能从“审查 PR / review”判断出来；显式写出来只是更稳。
 
 ## 终端输入模式
 
@@ -340,8 +359,8 @@ Permission confirmation required but no interactive handler is available
 - `user-prompt.md`：原始用户 prompt
 - `summary.md`：默认读取的精简总结
 - `findings.json`：结构化发现或测试结果
-- `raw_output.txt`：完整原始输出或日志
-- `response.md`：兼容旧流程的最终回答
+- `raw_output.txt`：bridge 捕获输出；`full` profile 下可由 Qoder 写详细记录
+- `response.md`：兼容旧流程的最终回答，通常自动生成
 - `status.json`：运行状态
 - `metadata.json`：使用的 CLI、命令、时间等元信息
 

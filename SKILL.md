@@ -49,17 +49,26 @@ Each run contains:
 - `prompt.md`: the actual prompt sent to Qoder
 - `summary.md`: concise result for Codex to read by default
 - `findings.json`: structured findings/tests for code review and test tasks
-- `raw_output.txt`: full raw Qoder output, logs, and detailed notes
-- `response.md`: backward-compatible final answer, usually mirroring `summary.md`
+- `raw_output.txt`: bridge-captured raw output by default; Qoder writes it only in `full` profile
+- `response.md`: backward-compatible final answer, usually generated from `summary.md`
 - `status.json`: Qoder's completion signal
 - `metadata.json`: bridge metadata
 - `stdout.txt` / `stderr.txt`: process output captured by the bridge
 
-For detached, YOLO, or app-chat sends, the bridge tells Qoder to write `raw_output.txt`, `summary.md`, `findings.json`, `response.md`, then `status.json`, using `.tmp` files and atomic renames. Treat `status.json` plus an existing `summary.md` or `response.md` as the completion signal. Do not treat partial `.tmp` files as complete.
+For detached, YOLO, or app-chat sends, the bridge uses an artifact profile and tells Qoder to write only the needed mailbox files, using `.tmp` files and atomic renames. Treat `status.json` plus an existing `summary.md` or `response.md` as the completion signal. Do not treat partial `.tmp` files as complete.
 
 ## Send A Task
 
-Use `agent` mode by default. With the default `--transport auto`, the bridge requires a logged-in `qodercli` discovered from `--qodercli`, `QODERCLI` / `QODERCLI_PATH`, or `PATH`. For detached/YOLO tasks it sends a mailbox artifact protocol; for short non-YOLO tasks it may send the raw user prompt and let the bridge create fallback artifacts from stdout. If no logged-in qodercli exists, stop and ask the user to fix setup instead of silently switching transports.
+Use `agent` mode by default. With the default `--transport auto`, the bridge requires a logged-in `qodercli` discovered from `--qodercli`, `QODERCLI` / `QODERCLI_PATH`, or `PATH`. For detached/YOLO tasks it sends a mailbox artifact profile; for short non-YOLO tasks it sends the raw user prompt and lets the bridge create fallback artifacts from stdout. If no logged-in qodercli exists, stop and ask the user to fix setup instead of silently switching transports.
+
+Artifact profiles:
+
+- `none`: no mailbox protocol; bridge captures stdout and creates fallback files.
+- `minimal`: Qoder writes only `summary.md` and `status.json`; bridge creates raw/findings/response fallbacks.
+- `review`: Qoder writes `summary.md`, `findings.json`, and `status.json`.
+- `test`: Qoder writes `summary.md`, `findings.json` with `tests`, and `status.json`; long logs should be referenced by path.
+- `full`: Qoder writes all mailbox artifacts, including `raw_output.txt` and `response.md`.
+- `auto`: default. Short non-YOLO sends use `none`; detached/YOLO sends infer `review` for CR/PR review prompts, `test` for test/e2e prompts, and `minimal` otherwise.
 
 For long tasks such as repository/PR code review, use real detached mode so Codex can return immediately and check later:
 
@@ -72,7 +81,7 @@ python3 "$QODER_BRIDGE" send \
   "Review this repository and write findings."
 ```
 
-Detached mode starts a background worker, returns `run_id` immediately, and later writes `summary.md`, `findings.json`, `raw_output.txt`, `response.md`, and `status.json`. Use `check`, `show`, or `wait` to inspect it.
+Detached mode starts a background worker, returns `run_id` immediately, and later writes the profile-specific artifacts. Use `check`, `show`, or `wait` to inspect it.
 
 After a successful detached send, report the `run_id`, run directory, and exact `check`, `show`, and `show --raw` commands, then stop the current turn. Do not immediately poll, wait, or say "I will keep waiting" unless the user explicitly asks to monitor, wait for completion, or check again later in the same request.
 
@@ -155,16 +164,16 @@ python3 "$QODER_BRIDGE" send \
 
 `--dangerously-skip-permissions` is kept as a compatibility alias, but prefer `--yolo` in this skill.
 
-For long tasks where token efficiency matters, rely on the artifact protocol:
+For long tasks where token efficiency matters, rely on `--artifact-profile auto` or choose the profile explicitly:
 
 ```bash
 python3 "$QODER_BRIDGE" send \
   --detach \
   --transport qodercli \
   --yolo \
-  --artifact-protocol \
+  --artifact-profile test \
   --cwd "$PWD" \
-  "Run the e2e suite. Write full logs to raw_output.txt, concise results to summary.md, and test details to findings.json."
+  "Run the e2e suite. Keep long logs in log files and report concise test results."
 ```
 
 If the user wants to watch Qoder answer in their already-open Terminal, and the selected Terminal tab is already running interactive `qodercli`, use `terminal-input`. This types the prompt into that tab and presses return. Codex only records that the prompt was sent; Qoder's output remains in Terminal and is not captured:
@@ -230,7 +239,7 @@ Use cron automation only for broad recurring scans, such as checking all pending
 ## Safety Rules
 
 - Prefer this mailbox protocol over scraping Qoder UI state, SQLite tables, or logs.
-- Tell Qoder to write only the mailbox artifacts (`raw_output.txt`, `summary.md`, `findings.json`, `response.md`, `status.json`) unless the user's request explicitly asks Qoder to modify project files.
+- Tell Qoder to write only the files requested by the selected artifact profile unless the user's request explicitly asks Qoder to modify project files.
 - Use absolute paths for `--cwd`, `--prompt-file`, and `--add-file` when possible.
 - If the bridge times out or `check` returns pending, report the run directory and use `check` or `show` later. Do not assume Qoder failed; it may still be running in the app.
 - If `qoder chat` is missing, run `qoder --help` and report the installed CLI capability instead of inventing another interface.
