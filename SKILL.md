@@ -85,6 +85,11 @@ Detached mode starts a background worker, returns `run_id` immediately, and late
 
 After a successful detached send, report the `run_id`, run directory, and exact `check`, `show`, and `show --raw` commands, then stop the current turn. Do not immediately poll, wait, or say "I will keep waiting" unless the user explicitly asks to monitor, wait for completion, or check again later in the same request.
 
+Detached follow-up rules:
+
+- Never run `wait` in the same turn after `send --detach` unless the user explicitly asks to block this turn until Qoder finishes.
+- Run at most one immediate `check --json` in the same turn after `send --detach`, only to verify the worker state. If it is pending, report the `run_id` and stop.
+
 ### YOLO Selection Guidance
 
 Choose `--yolo` deliberately; do not treat it as part of `--detach`.

@@ -168,6 +168,11 @@ python3 "$QODER_BRIDGE" send \
 
 正确体验是：看到这个返回后，Codex 不再继续等待。你可以稍后再查，也可以明确要求 Codex 继续监控。
 
+同一回合规则：
+
+- `send --detach` 成功后，不要在同一回合继续跑 `wait`，除非你明确要求“这次就等到 Qoder 完成”。
+- 同一回合最多跑一次 `check --json`，只用来确认 worker 是否启动；如果仍是 `pending`，应直接停下并保留 `run_id`。
+
 之后查询状态：
 
 ```bash
